@@ -1112,9 +1112,23 @@ send_yandex_disk_document() {
 
     local upload_path="${YD_FOLDER_PATH:+$YD_FOLDER_PATH/}$file_name"
     
+    # Проверка доступности API Яндекс.Диска
+    print_message "INFO" "Проверка доступности Яндекс.Диска..."
+    if ! curl -s --connect-timeout 10 --max-time 15 -o /dev/null -w "%{http_code}" "https://cloud-api.yandex.net" | grep -qE "^(200|301|302|401|403)$"; then
+        print_message "ERROR" "Яндекс.Диск недоступен. Проверьте интернет-соединение или возможные блокировки."
+        print_message "INFO" "Попробуйте проверить доступность вручную: curl -I https://cloud-api.yandex.net"
+        return 1
+    fi
+    
     print_message "INFO" "Получение ссылки для загрузки на Яндекс.Диск..."
-    local upload_url_response=$(curl -s -X GET "https://cloud-api.yandex.net/v1/disk/resources/upload?path=$(echo -n "$upload_path" | jq -sRr @uri)&overwrite=true" \
+    local upload_url_response=$(curl -s --connect-timeout 15 --max-time 30 -X GET "https://cloud-api.yandex.net/v1/disk/resources/upload?path=$(echo -n "$upload_path" | jq -sRr @uri)&overwrite=true" \
         -H "Authorization: OAuth $YD_TOKEN")
+    
+    local curl_exit_code=$?
+    if [[ $curl_exit_code -ne 0 ]]; then
+        print_message "ERROR" "Ошибка соединения с Яндекс.Диском (код: $curl_exit_code). Возможно, проблемы с сетью или API недоступен."
+        return 1
+    fi
     
     local upload_href=$(echo "$upload_url_response" | jq -r .href 2>/dev/null)
     local error_message=$(echo "$upload_url_response" | jq -r .message 2>/dev/null)
@@ -1122,21 +1136,37 @@ send_yandex_disk_document() {
 
     if [[ -z "$upload_href" || "$upload_href" == "null" ]]; then
         print_message "ERROR" "Не удалось получить ссылку для загрузки. Код: ${error_code:-Unknown}. Сообщение: ${error_message:-Unknown error}."
+        print_message "INFO" "Проверьте: 1) Правильность токена 2) Наличие места на диске 3) Существование папки: ${YD_FOLDER_PATH:-корневая}"
         return 1
     fi
 
-    print_message "INFO" "Загрузка файла на Яндекс.Диск..."
-    local upload_response=$(curl -s -X PUT "$upload_href" \
+    local file_size=$(du -h "$file_path" | cut -f1)
+    print_message "INFO" "Загрузка файла на Яндекс.Диск (размер: $file_size)..."
+    print_message "INFO" "Это может занять время в зависимости от скорости интернета..."
+    
+    # Загрузка с отображением прогресса и увеличенными таймаутами
+    local upload_response=$(curl --progress-bar --connect-timeout 30 --max-time 3600 -X PUT "$upload_href" \
         -H "Authorization: OAuth $YD_TOKEN" \
         --data-binary "@$file_path" \
-        -w "\n%{http_code}")
+        -w "\n%{http_code}" 2>&1 | tee /dev/stderr | tail -n1)
     
-    local http_code=$(echo "$upload_response" | tail -n1)
+    local curl_exit_code=$?
+    
+    if [[ $curl_exit_code -eq 28 ]]; then
+        print_message "ERROR" "Превышено время ожидания загрузки (timeout). Проверьте скорость интернета."
+        return 1
+    elif [[ $curl_exit_code -ne 0 ]]; then
+        print_message "ERROR" "Ошибка загрузки (код curl: $curl_exit_code). Возможно, соединение прервано."
+        return 1
+    fi
+    
+    local http_code="$upload_response"
 
     if [[ "$http_code" -eq 201 || "$http_code" -eq 200 ]]; then
+        print_message "SUCCESS" "Файл успешно загружен на Яндекс.Диск"
         return 0
     else
-        print_message "ERROR" "Ошибка при загрузке на Яндекс.Диск. HTTP код: ${http_code}. Ответ: ${upload_response}"
+        print_message "ERROR" "Ошибка при загрузке на Яндекс.Диск. HTTP код: ${http_code}"
         return 1
     fi
 }
